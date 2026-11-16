@@ -15,9 +15,16 @@
   11. /docs 可打开
   12. 排空等待超时 -> 202，在途数准确
   13. 上游挂起 -> 网关请求超时 504，不虚报成功、在途归零
+  14. 多并发在途请求排空
+  15. 未知节点 404
+  16. 同节点排空/恢复交错：旧排空报告 409 撤销，新请求已进入且原慢请求完整返回
+  17. 再次排空属于新一轮：旧排空不能借用新一轮结果报成功
+  18. 排空超时反映本轮有效性（含等待期间被静默撤销、旧轮次不借新结果）
 """
 from __future__ import annotations
 
+import asyncio
+import importlib.util
 import json
 import os
 import signal
@@ -118,6 +125,148 @@ def node_status(node: str) -> dict:
 def set_mode(port: int, mode: str) -> None:
     status, _, body = http("POST", f"http://127.0.0.1:{port}/control/mode?mode={mode}")
     assert status == 200, body
+
+
+def load_gateway_module():
+    """以独立模块名加载网关源码，用于在进程内确定性地驱动 drain/resume 交错。"""
+    # 测试进程本身也需要能 import fastapi/httpx（子进程由 launcher 单独注入路径）
+    for p in (PYLIBS, os.path.join(ROOT, "gateway")):
+        if p not in sys.path:
+            sys.path.insert(0, p)
+    path = os.path.join(ROOT, "gateway", "app.py")
+    spec = importlib.util.spec_from_file_location("gw_app_under_test", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeProbeResponse:
+    status_code = 200
+
+
+class _FakeProbeClient:
+    """让进程内测试能走真实 resume -> probe 路径，而不需要网络。"""
+
+    async def get(self, url: str, **kwargs):
+        return _FakeProbeResponse()
+
+
+def unit_drain_interleavings() -> None:
+    """进程内确定性验证排空轮次语义，避免只依赖 HTTP 时序。
+
+    覆盖：恢复后旧排空撤销（即使随后在途归零）、再次排空属新一轮且旧轮次
+    不借新结果、超时结论区分「本轮仍有效」与「本轮已被撤销」、有效排空
+    确实停接新流且在途归零。
+    """
+    mod = load_gateway_module()
+    NodeState, Gateway = mod.NodeState, mod.Gateway
+
+    async def run() -> list[tuple[str, bool, str]]:
+        results: list[tuple[str, bool, str]] = []
+
+        # A. 真实 resume 撤销旧排空：旧等待者即使看到在途归零也必须报 revoked
+        node = NodeState("n1", "http://127.0.0.1:1")
+        gw = Gateway([node])
+        gw.client = _FakeProbeClient()
+        node.healthy = True
+        node.inflight = 1
+        old = asyncio.create_task(gw.drain(node, timeout=5))
+        await asyncio.sleep(0.05)
+        results.append(("旧排空在等待中", not old.done(), ""))
+        await gw.resume(node)  # 真实恢复路径：作废轮次 + 健康探测
+        results.append((
+            "恢复经探测后重新可接流",
+            node.draining is False and node.healthy is True and node.can_serve() is True,
+            str(node.snapshot()),
+        ))
+        picked = await gw.pick_node()
+        results.append(("恢复后新请求可进入该节点", picked is node, str(picked)))
+        async with gw.cond:
+            node.inflight = max(node.inflight - 2, 0)  # 原慢请求 + 新请求都结束
+            gw.cond.notify_all()
+        old_res = await asyncio.wait_for(old, timeout=1)
+        results.append((
+            "恢复后旧排空报 revoked 而非 drained",
+            old_res.outcome == "revoked" and old_res.drained is False,
+            str(old_res),
+        ))
+
+        # B. 再次排空开启新一轮：旧轮次不得借用新一轮的 drained=true
+        node = NodeState("n2", "http://127.0.0.1:1")
+        gw = Gateway([node])
+        node.healthy = True
+        node.inflight = 1
+        round_a = asyncio.create_task(gw.drain(node, timeout=5))
+        await asyncio.sleep(0.05)
+        round_b = asyncio.create_task(gw.drain(node, timeout=5))
+        await asyncio.sleep(0.05)
+        res_a = await asyncio.wait_for(round_a, timeout=1)
+        results.append((
+            "旧一轮在下一轮开启后立即报 revoked",
+            res_a.outcome == "revoked" and res_a.drained is False,
+            str(res_a),
+        ))
+        results.append(("新一轮仍在等待在途归零", not round_b.done(), "已结束"))
+        async with gw.cond:
+            node.inflight = 0
+            gw.cond.notify_all()
+        res_b = await asyncio.wait_for(round_b, timeout=1)
+        results.append((
+            "新一轮在途归零后报 drained=true",
+            res_b.outcome == "drained" and res_b.drained is True,
+            str(res_b),
+        ))
+        results.append(("旧轮次 epoch 与新轮次不同", res_a.epoch != res_b.epoch, f"{res_a.epoch}/{res_b.epoch}"))
+
+        # C. 超时结论反映本轮有效性
+        node = NodeState("n3", "http://127.0.0.1:1")
+        gw = Gateway([node])
+        node.healthy = True
+        node.inflight = 1
+        timeout_res = await gw.drain(node, timeout=0.1)
+        results.append((
+            "本轮仍有效时超时报 timeout（非成功）",
+            timeout_res.outcome == "timeout" and timeout_res.drained is False,
+            str(timeout_res),
+        ))
+        results.append(("超时后节点保持排空", node.draining is True, str(node.snapshot())))
+        # 超时分支内的有效性核对：等待期间被静默撤销（不唤醒），到点仍须报 revoked
+        silent = asyncio.create_task(gw.drain(node, timeout=0.3))
+        await asyncio.sleep(0.05)
+        async with gw.cond:
+            node.drain_epoch += 1
+            node.draining = False
+            # 刻意不 notify：让等待自然超时，验证超时分支也核对轮次
+        silent_res = await asyncio.wait_for(silent, timeout=1.5)
+        results.append((
+            "超时到点时本轮已撤销 -> revoked 而非 timeout",
+            silent_res.outcome == "revoked" and silent_res.drained is False,
+            str(silent_res),
+        ))
+
+        # D. 有效排空：立即停接新流，在途归零才成功，完成后仍不接流
+        node = NodeState("n4", "http://127.0.0.1:1")
+        gw = Gateway([node])
+        node.healthy = True
+        node.inflight = 1
+        ok_task = asyncio.create_task(gw.drain(node, timeout=5))
+        await asyncio.sleep(0.05)
+        results.append(("排空中 pick_node 不接新流", await gw.pick_node() is None, ""))
+        async with gw.cond:
+            node.inflight = 0
+            gw.cond.notify_all()
+        ok_res = await asyncio.wait_for(ok_task, timeout=1)
+        results.append((
+            "在途归零后有效排空报 drained=true 且 inflight=0",
+            ok_res.outcome == "drained" and ok_res.inflight == 0 and node.inflight == 0,
+            str(ok_res),
+        ))
+        results.append(("排空完成后节点仍不接流", node.draining is True and node.can_serve() is False, str(node.snapshot())))
+        return results
+
+    for name, cond, detail in asyncio.run(run()):
+        check(f"[进程内] {name}", cond, detail)
 
 
 def main() -> int:
@@ -414,6 +563,171 @@ def main() -> int:
         check("排空未知节点返回 404", status == 404, body)
         status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/ghost/resume")
         check("恢复未知节点返回 404", status == 404, body)
+
+        # 16. 同节点排空/恢复交错：旧排空必须报撤销，不得给可下线回执
+        print("== 16. 排空等待中恢复 -> 旧排空撤销 ==")
+        # 场景 14 结束时两节点都排空；只恢复 node1，node2 继续排空以锁定流量
+        status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        assert status == 200, body
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status("node1")["eligible"]:
+            time.sleep(0.1)
+        check("node1 恢复后经探测可接流", node_status("node1")["eligible"] is True)
+        st2 = node_status("node2")
+        check("node2 仍保持排空", st2["draining"] is True and st2["eligible"] is False, str(st2))
+
+        result16 = {}
+
+        def slow_call16():
+            result16["status"], _, result16["body"] = http(
+                "GET", f"http://127.0.0.1:{GW_PORT}/proxy/slow?seconds=3", timeout=20
+            )
+
+        t16 = threading.Thread(target=slow_call16)
+        t16.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and node_status("node1")["inflight"] != 1:
+            time.sleep(0.05)
+        check("慢请求已进入 node1", node_status("node1")["inflight"] == 1)
+
+        drain16 = {}
+
+        def drain_call16():
+            t0 = time.time()
+            s, _, b = http(
+                "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=10",
+                timeout=20,
+            )
+            drain16["status"], drain16["body"], drain16["elapsed"] = s, b, time.time() - t0
+
+        td16 = threading.Thread(target=drain_call16)
+        td16.start()
+        time.sleep(0.4)
+        check("排空指令已生效且旧轮次仍在等待", node_status("node1")["draining"] is True)
+
+        # 在途慢请求尚未结束时恢复接流（问题描述的原始交错）
+        status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        check("恢复接口返回 200", status == 200, body)
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status("node1")["eligible"]:
+            time.sleep(0.05)
+        check("恢复后 node1 经健康探测重新可接流", node_status("node1")["eligible"] is True)
+
+        # 新请求确实进入 node1（排在慢请求之后，inflight 应为 2）
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        check("恢复后新请求进入 node1",
+              status == 200 and body["node"] == "node1", str(body))
+
+        td16.join(timeout=20)
+        old = json.loads(drain16.get("body") or "{}")
+        check("旧排空未被在途阻塞到超时/结束，已提前返回",
+              drain16.get("elapsed", 99) < 2.5, f"{drain16.get('elapsed'):.2f}s")
+        check("旧排空返回 409 且报告已撤销",
+              drain16.get("status") == 409 and old.get("revoked") is True, drain16.get("body"))
+        check("旧排空绝不给出可下线回执 drained=true",
+              old.get("drained") is False and old.get("outcome") == "revoked", str(old))
+
+        t16.join(timeout=20)
+        check("原慢请求仍拿到完整 200",
+              result16.get("status") == 200
+              and json.loads(result16["body"])["node"] == "node1"
+              and json.loads(result16["body"])["slept"] >= 2.5,
+              str(result16))
+        check("交错结束在途归零且 node1 仍可接流",
+              node_status("node1")["inflight"] == 0 and node_status("node1")["eligible"] is True,
+              str(node_status("node1")))
+
+        # 17. 再次排空属于新一轮，旧排空不能借新一轮结果报成功
+        print("== 17. 再次排空 -> 旧轮次不得借用新结果 ==")
+        result17 = {}
+
+        def slow_call17():
+            result17["status"], _, result17["body"] = http(
+                "GET", f"http://127.0.0.1:{GW_PORT}/proxy/slow?seconds=3", timeout=20
+            )
+
+        t17 = threading.Thread(target=slow_call17)
+        t17.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and node_status("node1")["inflight"] != 1:
+            time.sleep(0.05)
+        check("第二轮慢请求已进入 node1", node_status("node1")["inflight"] == 1)
+
+        round_a, round_b = {}, {}
+
+        def drain_round(name, slot, timeout_s):
+            t0 = time.time()
+            s, _, b = http(
+                "POST",
+                f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout={timeout_s}",
+                timeout=20,
+            )
+            slot["status"], slot["body"], slot["elapsed"] = s, b, time.time() - t0
+
+        ta = threading.Thread(target=drain_round, args=("A", round_a, 10))
+        ta.start()
+        time.sleep(0.4)
+        tb = threading.Thread(target=drain_round, args=("B", round_b, 10))
+        tb.start()
+        ta.join(timeout=20)
+        a = json.loads(round_a.get("body") or "{}")
+        check("旧一轮在下一轮开启后立即撤销",
+              round_a.get("status") == 409 and a.get("revoked") is True, round_a.get("body"))
+        check("旧一轮未被在途阻塞，未等待新轮次结束",
+              round_a.get("elapsed", 99) < 2.0, f"{round_a.get('elapsed'):.2f}s")
+        check("旧一轮没有报告成功", a.get("drained") is False, str(a))
+
+        tb.join(timeout=20)
+        b = json.loads(round_b.get("body") or "{}")
+        check("新一轮等全部在途结束才报 drained=true",
+              round_b.get("status") == 200 and b.get("drained") is True,
+              round_b.get("body"))
+        check("两轮 epoch 不同", a.get("drain_epoch") != b.get("drain_epoch"),
+              f"{a.get('drain_epoch')} vs {b.get('drain_epoch')}")
+        check("有效排空完成后节点仍停止接流",
+              node_status("node1")["draining"] is True
+              and node_status("node1")["eligible"] is False)
+        t17.join(timeout=20)
+        check("第二轮慢请求也拿到完整 200", result17.get("status") == 200, str(result17))
+
+        # 18. HTTP 层排空超时：本轮仍有效 -> 202 timeout；随后恢复不改变既有结论
+        print("== 18. 排空超时反映本轮有效性 ==")
+        status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        assert status == 200, body
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status("node1")["eligible"]:
+            time.sleep(0.1)
+        result18 = {}
+
+        def slow_call18():
+            result18["status"], _, result18["body"] = http(
+                "GET", f"http://127.0.0.1:{GW_PORT}/proxy/slow?seconds=3", timeout=20
+            )
+
+        t18 = threading.Thread(target=slow_call18)
+        t18.start()
+        deadline = time.time() + 5
+        while time.time() < deadline and node_status("node1")["inflight"] != 1:
+            time.sleep(0.05)
+        status, _, body = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=0.5"
+        )
+        b = json.loads(body)
+        check("本轮仍有效时超时返回 202",
+              status == 202 and b.get("outcome") == "timeout", body)
+        check("超时不是成功回执", b.get("drained") is False and b.get("revoked") is False, str(b))
+        check("超时后在途数如实报告", b.get("inflight") == 1, str(b))
+        check("超时后节点保持本轮排空", node_status("node1")["draining"] is True)
+        t18.join(timeout=20)
+        check("超时场景的慢请求仍拿到完整 200", result18.get("status") == 200, str(result18))
+
+        # 清理：恢复两节点，便于反复运行 / 演练
+        http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/resume")
+
+        # 进程内确定性交错（不依赖 HTTP 时序，覆盖静默撤销与超时分支）
+        print("== 19. 进程内确定性排空轮次交错 ==")
+        unit_drain_interleavings()
 
         print(f"\n==== 结果: {passed} passed, {failed} failed ====")
         return 1 if failed else 0

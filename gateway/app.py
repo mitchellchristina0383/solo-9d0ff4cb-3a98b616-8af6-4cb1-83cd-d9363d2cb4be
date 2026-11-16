@@ -5,7 +5,10 @@
   * 周期性主动探测上游，探测结论只影响健康标志，绝不改动人工排空标志；
   * 提供排空 / 恢复 / 状态管理 API；所有节点都不可接流时返回 503；
   * 排空期间新请求不再进入该节点，已在途的请求继续等待原响应返回；
-  * 排空 API 阻塞到在途请求全部结束后才报告 drained=true；
+  * 每次 drain 都是一轮独立指令；resume 或更新的一轮 drain 会使旧轮次立即失效，
+    旧等待者必须报告 revoked（409），绝不借用别的轮次结果报告 drained=true；
+  * 只有「本轮仍有效 + draining 仍为真 + inflight 归零」才报告可下线；
+  * 排空等待超时也先核对本轮有效性：失效则报撤销，仍有效才报超时；
   * 超时 / 连接错误 / 5xx 不虚报成功，并同步刷新健康状态，在途计数靠 try/finally 保证准确。
 """
 from __future__ import annotations
@@ -80,6 +83,9 @@ class NodeState:
     last_probe_ok: Optional[bool] = None
     last_probe_detail: str = "尚未探测"
     last_change_at: float = field(default_factory=time.time)
+    # 排空轮次：每次 drain 开启新一轮、每次 resume 作废当前轮，均递增。
+    # 等待者只认自己启动时捕获的轮次，绝不用别的轮次的结果报告成功。
+    drain_epoch: int = 0
 
     def can_serve(self) -> bool:
         return self.healthy and not self.draining
@@ -90,6 +96,7 @@ class NodeState:
             "base_url": self.base_url,
             "healthy": self.healthy,
             "draining": self.draining,
+            "drain_epoch": self.drain_epoch,
             "eligible": self.can_serve(),
             "inflight": self.inflight,
             "rr_hits": self.rr_hits,
@@ -99,6 +106,24 @@ class NodeState:
             "last_probe_ok": self.last_probe_ok,
             "last_probe_detail": self.last_probe_detail,
         }
+
+
+@dataclass
+class DrainResult:
+    """单轮排空的结论：drained / timeout / revoked，后两者都不得作为可下线回执。"""
+
+    outcome: str
+    inflight: int
+    epoch: int
+    detail: str
+
+    @property
+    def drained(self) -> bool:
+        return self.outcome == "drained"
+
+    @property
+    def revoked(self) -> bool:
+        return self.outcome == "revoked"
 
 
 class Gateway:
@@ -182,38 +207,73 @@ class Gateway:
                 print(f"[probe-loop] unexpected error: {exc!r}")
             await asyncio.sleep(PROBE_INTERVAL)
 
-    async def drain(
-        self, node: NodeState, timeout: Optional[float]
-    ) -> tuple[bool, int]:
-        """置排空标志并等待在途清零。返回 (是否排空完成, 剩余在途数)。"""
+    @staticmethod
+    def _drain_revoked(node: NodeState, epoch: int) -> bool:
+        """本轮排空是否已被撤销：resume 或更新的一轮 drain 都会使其失效。"""
+        return node.drain_epoch != epoch or not node.draining
+
+    async def drain(self, node: NodeState, timeout: Optional[float]) -> DrainResult:
+        """开启新一轮排空并等待在途清零。
+
+        只认本次调用捕获的轮次：
+          * resume / 后发起的 drain 会递增 epoch 并唤醒等待者，本轮立即作废；
+          * 作废后无论当前在途是否为 0，都只能报告 revoked，不能给出可下线回执；
+          * 超时同样先核对轮次有效性：已作废报 revoked，仍有效才报 timeout。
+        """
         loop = asyncio.get_running_loop()
         deadline = None if timeout is None else loop.time() + max(timeout, 0.0)
         async with self.cond:
+            # 每一轮都是独立指令，旧轮次从此不再有资格报告任何结果
+            node.drain_epoch += 1
+            epoch = node.drain_epoch
             node.draining = True
             node.last_change_at = time.time()
-            while node.inflight > 0:
+            # 唤醒上一轮等待者，让它们立即以 revoked 收尾，而不是等到本轮结束
+            self.cond.notify_all()
+            while True:
+                if self._drain_revoked(node, epoch):
+                    return DrainResult(
+                        "revoked", node.inflight, epoch,
+                        "本轮排空已被恢复或更新的一轮排空撤销，不得据此下线",
+                    )
+                if node.inflight == 0:
+                    return DrainResult(
+                        "drained", 0, epoch, "在途请求已全部结束，本轮排空完成"
+                    )
                 if deadline is None:
                     await self.cond.wait()
                     continue
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    return False, node.inflight
+                    # 超时结论也必须反映本轮指令是否仍有效
+                    if self._drain_revoked(node, epoch):
+                        return DrainResult(
+                            "revoked", node.inflight, epoch,
+                            "等待超时，但本轮排空此前已被恢复或更新的一轮排空撤销",
+                        )
+                    return DrainResult(
+                        "timeout", node.inflight, epoch,
+                        "等待在途请求结束超时，节点仍处于本轮排空中",
+                    )
                 # asyncio.Condition.wait 不支持 timeout，用 wait_for 限时等待
                 try:
                     await asyncio.wait_for(self.cond.wait(), timeout=remaining)
                 except asyncio.TimeoutError:
-                    pass  # 回到循环重新计算剩余时间 / 在途数
-            return True, 0
+                    pass  # 回到循环重新核对轮次、在途数与剩余时间
 
     async def resume(self, node: NodeState) -> None:
-        """恢复接流：先清排空并保守置为不健康，再立即探测，由探测决定能否接流。"""
+        """恢复接流：作废当前排空轮次并唤醒旧等待者，再经真实探测决定能否接流。"""
         async with self.cond:
+            # 递增 epoch 使仍在等待的旧排空立即失效，它们只能报告 revoked；
+            # 同时清排空并保守置为不健康，探测结论出来前一律不接流，杜绝状态窗口。
+            node.drain_epoch += 1
             node.draining = False
-            # 恢复不绕过故障探测：探测结论出来前一律不接流，杜绝状态窗口
             node.healthy = False
             node.last_probe_ok = None
             node.last_probe_detail = "恢复接流，等待首次探测确认"
             node.last_change_at = time.time()
+            # 唤醒旧排空等待者，让它们尽快带着撤销结论返回
+            self.cond.notify_all()
         await self.probe_one(node)
 
 
@@ -349,20 +409,55 @@ async def admin_status() -> dict:
 async def admin_drain(name: str, timeout: Optional[float] = DRAIN_DEFAULT_TIMEOUT):
     """排空节点：立即停止分配新请求，并阻塞等待在途请求全部结束。
 
-    只有在途数归零才返回 drained=true；超时仍有在途请求时返回 202，
-    drained=false 且节点继续保持排空状态。
+    * 200 drained=true：本轮仍有效且在途已归零，可作为下线回执；
+    * 202 drained=false：本轮仍有效但等待超时，节点继续保持排空中；
+    * 409 revoked=true：本轮已被 resume 或更新的一轮 drain 撤销，
+      即使此刻在途为 0 也绝不报告可下线。
     """
     node = gateway.get(name)
     if node is None:
         return JSONResponse(status_code=404, content={"error": "unknown_node", "name": name})
 
-    drained, inflight = await gateway.drain(node, timeout)
+    result = await gateway.drain(node, timeout)
+    # 结果与当前状态在同一把锁下取快照，避免报告与真实状态脱节
+    async with gateway.cond:
+        snap = node.snapshot()
+    # 任何回执（含成功与超时）都只在「本轮仍有效且节点仍在排空中」时签发：
+    # 若返回前恰好被 resume / 新一轮 drain 撤销，则降级为 revoked，
+    # 绝不签发失效的可下线回执或过时的超时结论。
+    if result.outcome != "revoked" and (
+        snap["drain_epoch"] != result.epoch or not snap["draining"]
+    ):
+        result = DrainResult(
+            "revoked", snap["inflight"], result.epoch,
+            "结论签发前本轮已被恢复或更新的一轮排空撤销，不得据此下线",
+        )
+    if result.outcome == "revoked":
+        return JSONResponse(
+            status_code=409,
+            content={
+                "node": name,
+                "draining": snap["draining"],
+                "drained": False,
+                "revoked": True,
+                "outcome": result.outcome,
+                "inflight": result.inflight,
+                "drain_epoch": result.epoch,
+                "current_drain_epoch": snap["drain_epoch"],
+                "detail": result.detail,
+            },
+        )
+    drained = result.outcome == "drained"
     body = {
         "node": name,
-        "draining": True,
+        "draining": snap["draining"],
         "drained": drained,
-        "inflight": inflight,
-        "detail": "在途请求已全部结束" if drained else "等待在途请求结束超时，节点仍处于排空中",
+        "revoked": False,
+        "outcome": result.outcome,
+        "inflight": result.inflight,
+        "drain_epoch": result.epoch,
+        "current_drain_epoch": snap["drain_epoch"],
+        "detail": result.detail,
     }
     return JSONResponse(status_code=200 if drained else 202, content=body)
 
@@ -378,10 +473,11 @@ async def admin_resume(name: str):
     return {
         "node": name,
         "draining": False,
+        "drain_epoch": snap["drain_epoch"],
         "healthy": snap["healthy"],
         "eligible": snap["eligible"],
         "last_probe_detail": snap["last_probe_detail"],
-        "detail": "已解除排空；是否可接流以健康探测结论为准",
+        "detail": "已解除排空并作废旧排空轮次；是否可接流以健康探测结论为准",
     }
 
 
